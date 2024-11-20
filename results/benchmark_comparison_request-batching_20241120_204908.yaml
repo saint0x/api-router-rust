@@ -1,0 +1,38 @@
+feature: request-batching
+timestamp: '20241120_204908'
+implemented: false
+config:
+  total_requests: 10000
+  concurrent_requests: 100
+new_results:
+- name: Simple Ping
+  rps: 6053.61
+  avg_latency: 852.9
+  p95_latency: 1027.87
+  p99_latency: 1054.3
+- name: Medium API
+  rps: 6522.55
+  avg_latency: 762.96
+  p95_latency: 979.1
+  p99_latency: 1009.01
+- name: Complex Process
+  rps: 33.14
+  avg_latency: 150734.33
+  p95_latency: 285818.96
+  p99_latency: 297830.48
+current_results:
+- name: Simple Ping
+  rps: 6190.07
+  avg_latency: 808.22
+  p95_latency: 1005.16
+  p99_latency: 1033.9
+- name: Medium API
+  rps: 7154.62
+  avg_latency: 687.49
+  p95_latency: 966.71
+  p99_latency: 994.49
+- name: Complex Process
+  rps: 2386.21
+  avg_latency: 2102.7
+  p95_latency: 3374.09
+  p99_latency: 3489.11

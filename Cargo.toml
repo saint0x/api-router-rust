@@ -1,0 +1,33 @@
+[package]
+name = "rust-router"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rust-router"
+path = "src/main.rs"
+
+[[bin]]
+name = "rust-router-batched"
+path = "src/main_batched.rs"
+
+[dependencies]
+tokio = { version = "1.32", features = ["full"] }
+hyper = { version = "0.14", features = ["full"] }
+bytes = "1.5"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "5.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+deadpool = "0.9"
+async-trait = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
