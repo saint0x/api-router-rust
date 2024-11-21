@@ -1,149 +1,105 @@
-mod router;
-
-use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::str::FromStr;
+use std::env;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
-use serde_json::json;
-use tokio::time::sleep;
-use std::time::Duration;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::router::Router;
+use rust_router::proxy::{
+    ProxyBuilder, LoggingMiddleware, HeaderTransform,
+    RateLimiter, CacheMiddleware,
+};
 
 async fn handle_request(
-    router: Router,
     req: Request<Body>,
-) -> Result<Response<Body>, Infallible> {
-    Ok(router.handle_request(req).await)
+    handler: Arc<rust_router::proxy::RequestHandler>,
+) -> Result<Response<Body>, hyper::Error> {
+    Ok(handler.handle_request(req).await)
 }
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging with timestamp
+    // Initialize logging with better formatting
     FmtSubscriber::builder()
         .with_max_level(Level::INFO)
+        .with_target(false)
         .with_thread_ids(true)
-        .with_thread_names(true)
         .with_file(true)
         .with_line_number(true)
-        .with_target(false)
+        .with_ansi(true)
+        .compact()
         .init();
 
-    // Create router instance
-    let router = Router::new();
-    let router_clone = router.clone();
+    // Get configuration from environment
+    let port = env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+    let pool_size = env::var("POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let timeout_secs = env::var("TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
 
-    // Simple route - baseline performance test
-    // Using static str for route path to avoid allocations
-    router.add_route("GET", "/ping", move |_req| {
-        let router = router_clone.clone();
-        async move {
-            // Pre-compute response to minimize allocations
-            router.json_response_direct(&json!({
-                "message": "pong",
-                "time": chrono::Utc::now()
-            }))
-            .await
-            .unwrap_or_else(|_| Response::builder()
-                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("Internal Server Error"))
-                .unwrap())
-        }
-    });
+    // Configure standard headers
+    let mut request_headers = HashMap::new();
+    request_headers.insert(
+        "X-Proxy-Request-ID".to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
 
-    // Medium complexity route - optimized for performance
-    let router_clone = router.clone();
-    router.add_route("GET", "/api/v1/data", move |_req| {
-        let router = router_clone.clone();
-        async move {
-            // Pre-compute timestamp to avoid multiple calls
-            let timestamp = chrono::Utc::now();
-            
-            // Using static values where possible to enable compiler optimizations
-            static VERSION: &str = "2.0";
-            static TAGS: [&str; 2] = ["performance", "optimized"];
-            
-            router.json_response_direct(&json!({
-                "id": 123,
-                "timestamp": timestamp,
-                "data": {
-                    "status": "active",
-                    "metrics": {
-                        "value": 42,
-                        "unit": "ms"
-                    },
-                    "tags": TAGS,
-                    "version": VERSION
-                }
-            }))
-            .await
-            .unwrap_or_else(|_| Response::builder()
-                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("Internal Server Error"))
-                .unwrap())
-        }
-    });
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "X-Powered-By".to_string(),
+        "Rust API Router".to_string(),
+    );
 
-    // Complex route - heavy processing simulation
-    let router_clone = router.clone();
-    router.add_route("POST", "/api/v1/process", move |mut req| {
-        let router = router_clone.clone();
-        async move {
-            // Simulate complex processing
-            sleep(Duration::from_millis(50)).await;
+    // Build proxy handler with all components
+    let handler = Arc::new(ProxyBuilder::new()
+        .with_pool_size(pool_size)
+        .with_timeout(timeout_secs)
+        // Add logging middleware
+        .with_middleware(LoggingMiddleware::new("proxy"))
+        // Add rate limiting
+        .with_middleware(RateLimiter::new(60, 1000)) // 1000 req/min
+        // Add caching for GET requests
+        .with_middleware(CacheMiddleware::new(300)) // 5 min cache
+        // Add header transform
+        .with_transform(HeaderTransform::new(
+            request_headers,
+            response_headers,
+        ))
+        .build());
 
-            // Parse request body with zero-copy where possible
-            let body_bytes = hyper::body::to_bytes(req.body_mut())
-                .await
-                .unwrap_or_default();
-
-            let request_data: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(data) => data,
-                Err(_) => {
-                    return Response::builder()
-                        .status(hyper::StatusCode::BAD_REQUEST)
-                        .body(Body::from("Invalid request body"))
-                        .unwrap();
-                }
-            };
-
-            // Pre-compute timestamp
-            let timestamp = chrono::Utc::now();
-            let request_id = format!("req_{}", timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-            router.json_response_direct(&json!({
-                "status": "processed",
-                "timestamp": timestamp,
-                "requestId": request_id,
-                "processed": request_data
-            }))
-            .await
-            .unwrap_or_else(|_| Response::builder()
-                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("Internal Server Error"))
-                .unwrap())
-        }
-    });
-
-    // Set up server
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
-    info!("Starting server on {}", addr);
-
+    // Create service
+    let addr = SocketAddr::from_str(&format!("0.0.0.0:{}", port)).unwrap();
     let make_svc = make_service_fn(move |_conn| {
-        let router = router.clone();
+        let handler = handler.clone();
         async move {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                handle_request(router.clone(), req)
+            Ok::<_, hyper::Error>(service_fn(move |req| {
+                let handler = handler.clone();
+                handle_request(req, handler)
             }))
         }
     });
 
-    let server = Server::bind(&addr).serve(make_svc);
+    // Create and run server with proper configuration
+    let server = Server::bind(&addr)
+        .tcp_nodelay(true)
+        .serve(make_svc);
 
-    // Run the server
+    info!("Proxy server running on {}", addr);
+    info!("Configuration:");
+    info!("  Pool Size: {}", pool_size);
+    info!("  Timeout: {}s", timeout_secs);
+    info!("  Rate Limit: 1000 req/min");
+    info!("  Cache TTL: 300s");
+
     if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
+        eprintln!("Server error: {}", e);
     }
 }

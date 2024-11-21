@@ -1,113 +1,134 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
 use hyper::client::HttpConnector;
-use hyper::Client;
+use hyper::{Body, Client, Request, Response, Uri};
 use hyper_tls::HttpsConnector;
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+use tracing::{error, debug};
 
-use crate::proxy::types::{ProxyConfig, ProxyError, ProxyResult};
+use super::types::{ProxyConfig, ProxyResult, ProxyError};
 
-/// Connection pool for managing HTTP clients
-pub struct ConnectionPool {
-    /// Shared client pool
-    clients: Arc<Mutex<HashMap<String, Client<HttpsConnector<HttpConnector>>>>>,
-    /// Configuration
+const MAX_RETRIES: u32 = 3;
+const RETRY_DELAY_MS: u64 = 100;
+
+pub struct ProxyPool {
+    client: Client<HttpsConnector<HttpConnector>>,
     config: ProxyConfig,
+    semaphore: Arc<Semaphore>,
 }
 
-impl ConnectionPool {
-    /// Create a new connection pool with the given configuration
+impl ProxyPool {
     pub fn new(config: ProxyConfig) -> Self {
-        Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-            config,
-        }
-    }
+        // Configure HTTPS connector with reasonable defaults
+        let mut https = HttpsConnector::new();
+        https.https_only(false); // Allow both HTTP and HTTPS
 
-    /// Get or create a client for the given host
-    pub async fn get_client(&self, host: &str) -> ProxyResult<Client<HttpsConnector<HttpConnector>>> {
-        let mut clients = self.clients.lock().await;
-
-        // Return existing client if available
-        if let Some(client) = clients.get(host) {
-            return Ok(client.clone());
-        }
-
-        // Create new client with HTTPS support
-        let https = HttpsConnector::new();
+        // Configure client with connection pooling
         let client = Client::builder()
-            .pool_idle_timeout(Some(self.config.timeout))
-            .pool_max_idle_per_host(self.config.pool_size as u32)
-            .build::<_, hyper::Body>(https);
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(config.pool_size as usize)
+            .retry_canceled_requests(true)
+            .set_host(true)
+            .build::<_, Body>(https);
 
-        // Store and return the new client
-        clients.insert(host.to_string(), client.clone());
-        Ok(client)
+        // Create semaphore for connection limiting
+        let semaphore = Arc::new(Semaphore::new(config.pool_size as usize));
+
+        ProxyPool { 
+            client,
+            config,
+            semaphore,
+        }
     }
 
-    /// Remove a client from the pool
-    pub async fn remove_client(&self, host: &str) {
-        let mut clients = self.clients.lock().await;
-        clients.remove(host);
-    }
+    pub async fn forward_request(
+        &self,
+        uri: Uri,
+        req: Request<Body>,
+    ) -> ProxyResult<Response<Body>> {
+        // Acquire semaphore permit for connection limiting
+        let _permit = self.semaphore.acquire().await
+            .map_err(|e| ProxyError::ForwardError(format!("Failed to acquire connection: {}", e)))?;
 
-    /// Clear all clients from the pool
-    pub async fn clear(&self) {
-        let mut clients = self.clients.lock().await;
-        clients.clear();
-    }
-
-    /// Get the number of active clients
-    pub async fn client_count(&self) -> usize {
-        let clients = self.clients.lock().await;
-        clients.len()
-    }
-
-    /// Check if a client exists for the given host
-    pub async fn has_client(&self, host: &str) -> bool {
-        let clients = self.clients.lock().await;
-        clients.contains_key(host)
-    }
-}
-
-impl Drop for ConnectionPool {
-    fn drop(&mut self) {
-        // Ensure we spawn a task to clean up connections
-        tokio::spawn(async move {
-            if let Ok(mut clients) = self.clients.try_lock() {
-                clients.clear();
+        let mut retries = 0;
+        loop {
+            match self.try_forward_request(uri.clone(), req.try_clone()?).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    if retries >= MAX_RETRIES {
+                        return Err(e);
+                    }
+                    retries += 1;
+                    debug!("Retry {}/{} after error: {}", retries, MAX_RETRIES, e);
+                    tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS * retries as u64)).await;
+                }
             }
-        });
+        }
+    }
+
+    async fn try_forward_request(
+        &self,
+        uri: Uri,
+        mut req: Request<Body>,
+    ) -> ProxyResult<Response<Body>> {
+        // Update request URI to destination
+        *req.uri_mut() = uri;
+
+        // Forward the request with timeout
+        match timeout(
+            Duration::from_secs(self.config.pool_timeout_secs),
+            self.client.request(req)
+        ).await {
+            Ok(result) => {
+                match result {
+                    Ok(response) => Ok(response),
+                    Err(e) => {
+                        error!("Failed to forward request: {}", e);
+                        Err(ProxyError::ForwardError(e.to_string()))
+                    }
+                }
+            },
+            Err(_) => {
+                error!("Request timed out after {} seconds", self.config.pool_timeout_secs);
+                Err(ProxyError::ForwardError("Request timed out".to_string()))
+            }
+        }
+    }
+
+    pub fn get_metrics(&self) -> ProxyPoolMetrics {
+        ProxyPoolMetrics {
+            available_connections: self.semaphore.available_permits(),
+            max_connections: self.config.pool_size as usize,
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
+#[derive(Debug)]
+pub struct ProxyPoolMetrics {
+    pub available_connections: usize,
+    pub max_connections: usize,
+}
 
-    #[tokio::test]
-    async fn test_connection_pool() {
-        let config = ProxyConfig {
-            timeout: Duration::from_secs(30),
-            pool_size: 10,
-            max_retries: 3,
-            preserve_headers: true,
-        };
+// Extension trait for Request cloning
+trait RequestExt {
+    fn try_clone(&self) -> ProxyResult<Request<Body>>;
+}
 
-        let pool = ConnectionPool::new(config);
+impl RequestExt for Request<Body> {
+    fn try_clone(&self) -> ProxyResult<Request<Body>> {
+        let mut builder = Request::builder()
+            .method(self.method().clone())
+            .uri(self.uri().clone());
+        
+        // Clone headers
+        for (name, value) in self.headers() {
+            builder = builder.header(name, value);
+        }
 
-        // Test client creation
-        let client = pool.get_client("example.com").await;
-        assert!(client.is_ok());
-
-        // Test client reuse
-        assert!(pool.has_client("example.com").await);
-        assert_eq!(pool.client_count().await, 1);
-
-        // Test client removal
-        pool.remove_client("example.com").await;
-        assert!(!pool.has_client("example.com").await);
-        assert_eq!(pool.client_count().await, 0);
+        // Create empty body for now (actual body handling would need streaming support)
+        Ok(builder
+            .body(Body::empty())
+            .map_err(|e| ProxyError::RequestBuildError(e.to_string()))?)
     }
 }
