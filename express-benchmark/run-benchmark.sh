@@ -1,41 +1,31 @@
 #!/bin/bash
 
-# Kill any existing node processes
-pkill node
+# Kill any existing processes
+pkill -f 'node server.js' || true
+pkill -f 'api-router-rust' || true
+lsof -ti:3001 | xargs kill -9 2>/dev/null || true
+lsof -ti:3002 | xargs kill -9 2>/dev/null || true
 
-# Build Rust proxy
-echo "Building Rust proxy..."
-cargo build --release
-
-# Start Express backend
-echo "Starting Express backend on port 3000..."
-BACKEND_PORT=3000 node backend.js &
-BACKEND_PID=$!
-
-# Wait for backend to start
+# Wait for ports to be freed
 sleep 2
 
-# Start Rust proxy
-echo "Starting Rust proxy on port 3001..."
-PORT=3001 ../target/release/rust-router &
+# Start the Express server
+node server.js &
+SERVER_PID=$!
+
+# Build and start the Rust proxy
+cd ..
+cargo build && cargo run &
 PROXY_PID=$!
 
-# Start Express direct implementation
-echo "Starting Express direct implementation on port 3002..."
-EXPRESS_PORT=3002 node server.js &
-EXPRESS_PID=$!
-
-# Wait for all servers to be ready
-sleep 2
+# Wait for servers to start
+sleep 5
 
 # Run benchmark
-echo "Running benchmark..."
+cd express-benchmark
 node benchmark.js
 
 # Cleanup
-echo "Cleaning up..."
-kill $BACKEND_PID
-kill $PROXY_PID
-kill $EXPRESS_PID
-
-echo "Done!"
+kill $SERVER_PID $PROXY_PID 2>/dev/null || true
+pkill -f 'node server.js' || true
+pkill -f 'api-router-rust' || true
